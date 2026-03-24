@@ -13,6 +13,8 @@ Two prediction modes:
   - REMOTE: calls the FastAPI backend over HTTP
 """
 
+import base64
+import io
 import os
 import sys
 import tempfile
@@ -20,6 +22,7 @@ from pathlib import Path
 
 import requests
 import streamlit as st
+from PIL import Image
 
 # ---------------------------------------------------------------------------
 # Make the 490 project importable so we can call the models directly.
@@ -185,6 +188,16 @@ def local_predict(tmp_path: str, modality: str) -> dict | None:
 # Remote prediction — calls the FastAPI backend (490/app.py) over HTTP.
 # ---------------------------------------------------------------------------
 
+def _pil_from_api_b64(data: str | None):
+    """Decode a PNG base64 string from the API into a PIL image."""
+    if not data:
+        return None
+    try:
+        return Image.open(io.BytesIO(base64.b64decode(data)))
+    except Exception:
+        return None
+
+
 def remote_predict(tmp_path: str, modality: str, api_url: str) -> dict | None:
     """POST the file to the running FastAPI backend and return the result."""
     headers: dict[str, str] = {}
@@ -210,11 +223,39 @@ def remote_predict(tmp_path: str, modality: str, api_url: str) -> dict | None:
         if not isinstance(result, dict):
             raise ValueError("API did not return a JSON object")
 
-        prob = float(result.get("prediction_score") or result.get("probability", 0))
-        label = result.get("verdict", result.get("label", "unknown")).lower()
+        raw_score = result.get("prediction_score")
+        if raw_score is None:
+            raw_score = result.get("probability")
+        prob = float(raw_score) if raw_score is not None else 0.0
+
+        label = result.get("verdict", result.get("label", "unknown"))
+        if isinstance(label, str):
+            label = label.lower()
         if label == "fake":
             label = "deepfake"
-        return {"label": label, "probability": prob, "detail": result.get("detail")}
+        if label not in ("deepfake", "real", "unknown"):
+            label = "deepfake" if prob >= 0.5 else "real"
+
+        out: dict = {
+            "label": label,
+            "probability": round(prob, 4),
+            "detail": result.get("detail"),
+        }
+
+        b64 = result.get("annotated_image_base64")
+        if b64:
+            out["annotated_image"] = _pil_from_api_b64(b64)
+
+        if result.get("waveform_data") is not None:
+            out["waveform_data"] = result["waveform_data"]
+
+        if result.get("markers") is not None:
+            out["markers"] = result["markers"]
+
+        if result.get("image_markers") is not None:
+            out["image_markers"] = result["image_markers"]
+
+        return out
 
     except requests.exceptions.RequestException as e:
         st.error(
